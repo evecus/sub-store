@@ -1,0 +1,97 @@
+type SubsType = 'sub' | 'collection';
+type DeleteMode = 'archive' | 'permanent';
+type ArchiveItemType = 'sub' | 'col' | 'file' | 'artifact' | 'share';
+
+type MyAxiosRes = ErrorResponse | SucceedResponse;
+
+interface ErrorResponse {
+  status: 'failed';
+  error: {
+    code: string;
+    type: string;
+    message: string;
+    details?: string;
+  };
+}
+
+interface SucceedResponse {
+  status: 'success';
+  data?: any;
+}
+
+interface DebugLogEntry {
+  id: string;
+  time: number;
+  level: string;
+  message: string;
+}
+
+interface DebugLogQuery {
+  limit?: number | string;
+  keyword?: string;
+  regex?: boolean | string;
+  ignoreCase?: boolean | string;
+}
+
+interface DebugLogsResponse {
+  logs: DebugLogEntry[];
+  total: number;
+  maxCount: number;
+}
+
+interface IpApiData {
+  shareUrl: string;
+  info: {
+    query: string;
+    status: string;
+    continent: string;
+    continentCode: string;
+    country: string;
+    countryCode: string;
+    region: string;
+    regionName: string;
+    city: string;
+    district: string;
+    zip: string;
+    lat: number;
+    lon: number;
+    timezone: string;
+    offset: number;
+    currency: string;
+    isp: string;
+    org: string;
+    as: string;
+    asname: string;
+    mobile: boolean;
+    proxy: boolean;
+    hosting: boolean;
+  };
+}
+
+interface IpApiResponse {
+  status: 'success' | 'failed';
+  data: IpApiData;
+}
+
+type NodeInfoIpApiStatus = 'idle' | 'loading' | 'success' | 'error';
+
+interface NodeInfo {
+  name: string;
+  server: string;
+  port: number;
+  id: number;
+  password?: string;
+  UUID?: string;
+  tls?: boolean;
+  'skip-cert-verify'?: boolean;
+  tfo?: boolean;
+  udp?: boolean;
+  type?:
+    | 'trojan'
+    | 'ss'
+    | 'socks5'
+    | 'http'
+    | 'shadowsocks'
+    | 'vmess'
+    | 'custom';
+}

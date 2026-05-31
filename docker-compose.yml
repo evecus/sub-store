@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  sub-store:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sub-store:latest
+    container_name: sub-store
+    restart: unless-stopped
+    ports:
+      - "3000:3000"          # 前端 + 后端 API 合并在同一端口
+    volumes:
+      - sub-store-data:/root/.sub-store
+    environment:
+      # ── 服务器 ──────────────────────────────────────────────
+      SUB_STORE_BACKEND_API_HOST: "0.0.0.0"
+      SUB_STORE_BACKEND_API_PORT: "3000"
+      SUB_STORE_DATA_PATH: "/root/.sub-store/data.json"
+
+      # 前后端合并模式：后端同时提供前端静态文件
+      SUB_STORE_BACKEND_MERGE: "true"
+
+      # ── 可选：启动时从 URL 恢复数据 ─────────────────────────
+      # SUB_STORE_DATA_URL: "https://example.com/backup.json"
+
+      # ── 可选：定时任务（标准 cron 或 @every Xm 格式）──────
+      # SUB_STORE_BACKEND_SYNC_CRON: "@every 1h"
+      # SUB_STORE_BACKEND_DOWNLOAD_CRON: "@every 12h"
+      # SUB_STORE_BACKEND_UPLOAD_CRON: "@every 6h"
+      # SUB_STORE_PRODUCE_CRON: "@every 2h,sub,my-sub"
+      # SUB_STORE_MMDB_CRON: "@every 24h"
+
+      # ── 可选：MaxMindDB GeoIP ────────────────────────────────
+      # SUB_STORE_MMDB_COUNTRY_PATH: "/root/.sub-store/Country.mmdb"
+      # SUB_STORE_MMDB_COUNTRY_URL: "https://example.com/Country.mmdb"
+
+volumes:
+  sub-store-data:

@@ -1,0 +1,24 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env.local
+
+# Backend
+backend/sub-store*
+backend/internal/static/dist/
+*.exe
+
+# Data
+*.json
+!package.json
+!tsconfig*.json
+!commitlint.config.js
+!vercel.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/*.log
