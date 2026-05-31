@@ -93,8 +93,9 @@ func (s *Server) registerStaticFrontend() {
 
 		// SPA fallback: serve index.html so Vue Router handles the route
 		r2 := *r
-		r2.URL = *r.URL
-		r2.URL.Path = "/"
+		u2 := *r.URL
+		u2.Path = "/"
+		r2.URL = &u2
 		fileServer.ServeHTTP(w, &r2)
 	})
 }
