@@ -1,0 +1,252 @@
+mod assets;
+mod bundle;
+mod host;
+mod plugins;
+mod rust_tasks;
+
+use anyhow::{Context as _, Result};
+use axum::{
+    body::{to_bytes, Body},
+    extract::{Request, State},
+    http::{header, HeaderName, HeaderValue, StatusCode},
+    response::Response,
+    routing::get,
+    Router,
+};
+use host::{Job, JobTx, JsRequest};
+use std::{collections::HashMap, env, path::PathBuf, sync::OnceLock, time::Duration};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+};
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let data_dir = PathBuf::from(
+        env::var("SUB_STORE_DATA_DIR").unwrap_or_else(|_| "./data".into()),
+    );
+    std::fs::create_dir_all(&data_dir)?;
+
+    // 前端与后端 JS 都编译进二进制；SUB_STORE_BUNDLE 仅用于开发时覆盖。
+    let source = match env::var("SUB_STORE_BUNDLE") {
+        Ok(p) => {
+            let s = tokio::fs::read_to_string(&p)
+                .await
+                .with_context(|| format!("读取外部 bundle 失败: {p}"))?;
+            tracing::info!("使用外部 bundle {p} ({} 字节)", s.len());
+            s
+        }
+        Err(_) => {
+            let s = assets::BUNDLE_JS.to_string();
+            tracing::info!("使用内嵌 bundle ({} 字节)", s.len());
+            s
+        }
+    };
+    assets::self_check()?;
+
+    // ---- Rust 侧重写的三块能力（不依赖 Node，不透传代理）----
+    let dns = std::sync::Arc::new(rust_tasks::RustDns::from_env());
+    tracing::info!("[dns] Rust 侧解析器: {:?}", dns.servers());
+    let geoip = std::sync::Arc::new(rust_tasks::RustGeoIp::open(
+        env::var("SUB_STORE_MMDB_COUNTRY_PATH").ok().map(PathBuf::from),
+        env::var("SUB_STORE_MMDB_ASN_PATH").ok().map(PathBuf::from),
+    )?);
+    tracing::info!("[geoip] mmdb 已按需加载");
+
+    // QuickJS 的 Runtime/Context 不是 Send/Sync，必须固定在一个专用线程里。
+    // axum / 定时任务只持有 mpsc 发送端，请求通过 Job 投递过去，天然串行。
+    let (tx, rx) = mpsc::channel::<Job>(64);
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
+    let thread_source = source.clone();
+    let thread_data_dir = data_dir.clone();
+    let thread_dns = dns.clone();
+    let thread_geoip = geoip.clone();
+    let thread_cors = cors_config().map(str::to_string);
+
+    std::thread::Builder::new()
+        .name("quickjs-host".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("创建 QuickJS 线程 runtime 失败");
+            rt.block_on(async move {
+                match host::JsHost::new(
+                    &thread_source,
+                    &thread_data_dir,
+                    thread_dns,
+                    thread_geoip,
+                    thread_cors,
+                )
+                .await
+                {
+                    Ok(js_host) => {
+                        let _ = ready_tx.send(Ok(()));
+                        let mut rx = rx;
+                        while let Some(job) = rx.recv().await {
+                            let resp = js_host.dispatch(job.req).await;
+                            let _ = job.reply.send(resp);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
+                }
+            });
+        })
+        .context("启动 QuickJS 专用线程失败")?;
+
+    ready_rx.await.context("QuickJS 宿主线程无响应")??;
+    tracing::info!("QuickJS 宿主就绪：未加载 Node.js，未启用任何代理");
+    tracing::info!(
+        "[cors] {}",
+        if cors_config().is_some() {
+            "跨域白名单模式（保留 Origin）"
+        } else {
+            "内嵌同源模式（剥离 Origin）"
+        }
+    );
+
+    let cron_path =
+        env::var("SUB_STORE_SYNC_PATH").unwrap_or_else(|_| "/api/utils/env".into());
+    let cron_every = Duration::from_secs(
+        env::var("SUB_STORE_SYNC_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+    );
+    let cron = rust_tasks::spawn_sync_scheduler(tx.clone(), cron_path.clone(), cron_every);
+    tracing::info!("[cron] Rust 调度器已启动: 每 {cron_every:?} 触发 {cron_path}");
+
+    // 真实服务里这两个能力通过 host function 暴露给 JS；此处先完成初始化自检。
+    let _ = (dns, geoip);
+
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .fallback(dispatch)
+        .with_state(tx);
+
+    let addr = env::var("SUB_STORE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("单端口就绪：网页与 API 共用 http://{addr}");
+    axum::serve(listener, app).await?;
+    cron.abort();
+    Ok(())
+}
+
+/// 后端只占这三个前缀（与前端 sw.js 的 NavigationRoute denylist 一致）。
+/// 其余路径全部由内嵌前端处理，`/` 不再走上游那个 302 跳 Vercel 的分支。
+fn is_backend_path(p: &str) -> bool {
+    ["/api/", "/download/", "/share/"]
+        .iter()
+        .any(|prefix| p.starts_with(prefix))
+        || matches!(p, "/api" | "/download" | "/share")
+}
+
+/// 可选跨域白名单（上游 utils/cors.js 的 `cors=` 参数）。
+/// 未设置时走内嵌同源模式：前端与 API 同端口，浏览器不做 CORS 校验，
+/// Rust 边界直接剥离 Origin，避免上游默认白名单误伤同源的 PATCH/POST。
+fn cors_config() -> Option<&'static str> {
+    static CORS: OnceLock<Option<String>> = OnceLock::new();
+    CORS.get_or_init(|| env::var("SUB_STORE_CORS_ORIGINS").ok())
+        .as_deref()
+}
+
+/// 单端口统一入口：API → QuickJS；其它 → 内嵌静态前端（含 SPA fallback）。
+async fn dispatch(State(tx): State<JobTx>, mut req: Request) -> Response {
+    if is_backend_path(req.uri().path()) {
+        if cors_config().is_none() {
+            req.headers_mut().remove(header::ORIGIN);
+        }
+        return proxy(State(tx), req).await;
+    }
+    let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
+    let headers = req.headers().clone();
+    assets::serve(&path, &headers, &method)
+}
+
+async fn proxy(State(tx): State<JobTx>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let bytes = match to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => return text(StatusCode::BAD_REQUEST, format!("读取请求体失败: {e}")),
+    };
+
+    let mut headers = HashMap::new();
+    for (k, v) in parts.headers.iter() {
+        headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
+    }
+
+    // 非 Node 分支的 extractURL() 用 /https?:\/\/[^/]+(\/[^?]*)/ 提取 path，
+    // 只认绝对 URL（QX/Surge 宿主传的就是完整 URL）。传相对路径会把所有请求都当成 "/"，
+    // 命中上游那个 302 跳 Vercel 前端的重定向。
+    let authority = parts
+        .headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1:3000");
+    let url = format!("http://{authority}{}", parts.uri);
+
+    let js_req = JsRequest {
+        method: parts.method.to_string(),
+        url,
+        headers,
+        body: String::from_utf8_lossy(&bytes).to_string(),
+    };
+
+    let (reply, reply_rx) = oneshot::channel();
+    if tx
+        .send(Job {
+            req: js_req,
+            reply,
+        })
+        .await
+        .is_err()
+    {
+        return text(StatusCode::BAD_GATEWAY, "QuickJS 宿主已退出".into());
+    }
+
+    let result = match tokio::time::timeout(Duration::from_secs(35), reply_rx).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(_)) => return text(StatusCode::BAD_GATEWAY, "QuickJS 响应通道关闭".into()),
+        Err(_) => return text(StatusCode::GATEWAY_TIMEOUT, "QuickJS 处理超时".into()),
+    };
+
+    match result {
+        Ok(resp) => {
+            let mut builder = Response::builder()
+                .status(StatusCode::from_u16(resp.status).unwrap_or(StatusCode::OK));
+            for (k, v) in &resp.headers {
+                if let (Ok(name), Ok(val)) = (
+                    HeaderName::from_bytes(k.as_bytes()),
+                    HeaderValue::from_str(v),
+                ) {
+                    builder = builder.header(name, val);
+                }
+            }
+            builder
+                .body(Body::from(resp.body))
+                .unwrap_or_else(|_| text(StatusCode::INTERNAL_SERVER_ERROR, "响应构造失败".into()))
+        }
+        Err(e) => {
+            tracing::error!("dispatch 失败: {e:#}");
+            text(StatusCode::BAD_GATEWAY, format!("QuickJS dispatch 失败: {e}"))
+        }
+    }
+}
+
+fn text(status: StatusCode, body: String) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .unwrap()
+}

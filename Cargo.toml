@@ -1,0 +1,26 @@
+[package]
+name = "substore"
+version = "0.1.0"
+edition = "2021"
+description = "Run Sub-Store backend JS in QuickJS with a Rust host, no Node.js runtime"
+
+[dependencies]
+rquickjs = { version = "0.14", features = ["futures", "macro"] }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+maxminddb = "0.24"
+rust-embed = { version = "8", features = ["debug-embed"] }
+flate2 = "1"
+
+[profile.release]
+opt-level = "s"        # 单二进制体积优先
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
