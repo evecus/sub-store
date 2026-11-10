@@ -8,9 +8,18 @@
 //!  - 与 JS 之间只交换 JSON 字符串，避免大量值转换。
 
 use anyhow::{anyhow, Context as _, Result};
-use rquickjs::{function::Async, AsyncContext, AsyncRuntime, Ctx, Function, Promise};
+use rquickjs::{
+    function::Async, AsyncContext, AsyncRuntime, CatchResultExt, Ctx, Function, Module, Promise,
+};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use crate::{
     plugins::{Cache, Http},
@@ -37,10 +46,14 @@ pub struct JsResponse {
 
 pub struct JsHost {
     // Runtime 必须保活；Context 只是它的一个视图。
-    #[allow(dead_code)]
     runtime: AsyncRuntime,
     context: AsyncContext,
+    /// 每处理若干请求触发一次 GC，压住循环引用造成的长期堆增长。
+    gc_counter: AtomicU32,
 }
+
+/// 每 64 次 dispatch 做一次完整 GC。间隔太小会拖慢，太大则堆会缓慢累积。
+const GC_EVERY: u32 = 64;
 
 /// QuickJS 的 Runtime/Context 不是 Send/Sync，必须固定在一个专用线程里。
 /// axum 与定时任务只持有这个通道的发送端，通过 Job 把请求投递过去。
@@ -263,13 +276,23 @@ fn install_globals<'js>(
 
 impl JsHost {
     pub async fn new(
-        bundle_source: &str,
+        bundle_source: Option<&str>,
         data_dir: &std::path::Path,
         dns: Arc<RustDns>,
         geoip: Arc<RustGeoIp>,
         cors_origins: Option<String>,
     ) -> Result<Self> {
         let runtime = AsyncRuntime::new().map_err(q).context("创建 QuickJS Runtime")?;
+        // 硬上限防止用户自定义脚本把盒子内存吃光；0 表示不限制。
+        let limit = std::env::var("SUB_STORE_JS_MEMORY_LIMIT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(256 * 1024 * 1024);
+        runtime.set_memory_limit(limit).await;
+        runtime.set_gc_threshold(512 * 1024).await;
+        if limit > 0 {
+            tracing::info!("[quickjs] JS 堆上限 {} MB，GC 阈值 512 KB", limit / 1024 / 1024);
+        }
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(q)
@@ -283,34 +306,25 @@ impl JsHost {
             .await
             .context("注入宿主全局失败")?;
 
-        let patched = crate::bundle::prepare(bundle_source)?;
-        // 包一层 try/catch，才能把 QuickJS 内部异常拿到 Rust 侧看到
-        let boot = format!(
-            "try{{\n{patched}\n}}catch(e){{globalThis.__bootError=String((e&&e.stack)||e)}}"
-        );
-
-        let (boot_err, has_dispatch): (Option<String>, bool) = context
-            .with(|ctx| -> Result<_, anyhow::Error> {
-                ctx.eval::<(), _>(boot).map_err(q)?;
-                let err: Option<String> = ctx.globals().get("__bootError").map_err(q)?;
-                let ok: bool = ctx
-                    .eval("typeof globalThis.__substoreDispatch === 'function'")
-                    .map_err(q)?;
-                Ok((err, ok))
-            })
-            .await?;
-
-        if let Some(e) = boot_err {
-            return Err(anyhow!("bundle 启动异常:\n{e}"));
-        }
+        // 默认走预编译字节码；只有外部覆盖 bundle 时才退回源码编译。
+        let has_dispatch: bool = match bundle_source {
+            Some(src) => boot_from_source(&context, src).await?,
+            None => boot_from_bytecode(&context, crate::assets::BUNDLE_BYTECODE).await?,
+        };
         anyhow::ensure!(has_dispatch, "bundle 未注册 __substoreDispatch，补丁未生效");
+        runtime.run_gc().await; // 回收启动期临时对象
 
-        Ok(Self { runtime, context })
+        Ok(Self {
+            runtime,
+            context,
+            gc_counter: AtomicU32::new(0),
+        })
     }
 
     /// 一次 HTTP 请求 → 一次 JS dispatch → $done 回吐响应。
     /// 调用方必须保证串行（专用线程里的 host loop 已保证）。
     pub async fn dispatch(&self, req: JsRequest) -> Result<JsResponse> {
+        let n = self.gc_counter.fetch_add(1, Ordering::Relaxed);
         let req_json = serde_json::to_string(&req)?;
         let context = &self.context;
 
@@ -335,9 +349,46 @@ impl JsHost {
                 .await
                 .context("JS dispatch 超时（30s）")?;
         let raw = inner.map_err(q)?;
-
-        serde_json::from_str::<JsResponse>(&raw).with_context(|| {
+        let resp = serde_json::from_str::<JsResponse>(&raw).with_context(|| {
             format!("解析 $done 响应失败，原始内容前 500 字节: {}", &raw[..raw.len().min(500)])
-        })
+        });
+
+        // 在 async_with 之外调用，避免与 runtime 内部锁重叠。
+        if n % GC_EVERY == GC_EVERY - 1 {
+            self.runtime.run_gc().await;
+        }
+        resp
     }
+}
+
+const DISPATCH_CHECK: &str = "typeof globalThis.__substoreDispatch === 'function'";
+
+/// 源码路径：仅开发时外部覆盖 bundle 使用。
+/// 不再用字符串拼 try/catch（会再复制一份 3.3MB 源码），直接借 rquickjs 的 catch 取异常。
+async fn boot_from_source(context: &AsyncContext, src: &str) -> Result<bool> {
+    let patched = crate::bundle::prepare(src)?;
+    let ok = context
+        .with(|ctx| -> Result<bool> {
+            let boot: rquickjs::Result<()> = ctx.eval(patched.as_str());
+            boot.catch(&ctx)
+                .map_err(|e| anyhow!("bundle 启动异常: {e}"))?;
+            let ok: bool = ctx.eval(DISPATCH_CHECK).map_err(q)?;
+            Ok(ok)
+        })
+        .await?;
+    drop(patched); // 源码字符串立刻归还
+    Ok(ok)
+}
+
+/// 字节码路径：反序列化后直接执行，跳过 3.3MB 源码解析，也不把源码文本搬进 JS 堆。
+async fn boot_from_bytecode(context: &AsyncContext, bytes: &'static [u8]) -> Result<bool> {
+    context
+        .async_with(async move |ctx| -> Result<bool> {
+            let module = unsafe { Module::load(ctx.clone(), bytes) }.map_err(q)?;
+            let (_module, promise) = module.eval().map_err(q)?;
+            promise.into_future::<()>().await.map_err(q)?;
+            let ok: bool = ctx.eval(DISPATCH_CHECK).map_err(q)?;
+            Ok(ok)
+        })
+        .await
 }

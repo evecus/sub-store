@@ -17,10 +17,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 maxminddb = "0.24"
 rust-embed = { version = "8", features = ["debug-embed"] }
 flate2 = "1"
+bytes = "1"
+# 实测：mimalloc 在本场景（QuickJS 大量小对象 + 长期驻留）反而使 RSS 从 50MB 涨到 70MB，
+# 且预留 1GB 虚拟地址。默认关闭，仅作为可选 feature 供其他负载复验。
+mimalloc = { version = "0.1", default-features = false, optional = true }
+
+[features]
+default = []
+mimalloc = ["dep:mimalloc"]
 
 [profile.release]
-opt-level = "s"        # 单二进制体积优先
-lto = true
+opt-level = 3
+lto = "fat"
 codegen-units = 1
-strip = "symbols"
 panic = "abort"
+strip = "symbols"

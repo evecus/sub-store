@@ -6,20 +6,29 @@
 //! 前端的两个"同源化"处理（否则页面会去连公网 https://sub.store）：
 //!  1. index.html 注入引导脚本，预置 localStorage.hostAPI 指向 location.origin；
 //!  2. 把编译期写死的默认 API 字面量 "https://sub.store" 改成 location.origin 兜底。
+//!
+//! 内存策略：所有响应体都是 `Bytes`（引用计数，克隆零拷贝），内嵌文件直接用
+//! `Bytes::from_static` 指向 .rodata；修补过的文件只在启动时分配一次并永久缓存。
 
 use axum::{
     body::Body,
     http::{header, HeaderMap, StatusCode},
     response::Response,
 };
+use bytes::Bytes;
 use rust_embed::RustEmbed;
-use std::{collections::HashMap, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
 
 #[derive(RustEmbed)]
 #[folder = "assets/dist/"]
 struct Frontend;
 
-/// 后端 JS bundle：编译期常量，运行时不需要任何磁盘文件。
+/// 预编译的 QuickJS 字节码（由 `cargo run --bin gen_bytecode` 生成）。
+/// 运行时直接反序列化执行，跳过 3.3MB 源码解析；源码文本不进 JS 堆。
+pub const BUNDLE_BYTECODE: &[u8] = include_bytes!("../assets/sub-store.bundle.qbc");
+
+/// 原始 bundle 源码：只用于「字节码不兼容」时的降级路径（SUB_STORE_FORCE_SOURCE=1）
+/// 以及开发时重新生成字节码。它在 .rodata 里，默认路径不会触碰，不影响常驻内存。
 pub const BUNDLE_JS: &str = include_str!("../assets/sub-store.bundle.js");
 
 /// 前端 localStorage 的 key 与"本地后端"条目名。
@@ -66,9 +75,9 @@ const DEFAULT_API_LITERAL: &str = r#""https://sub.store""#;
 const DEFAULT_API_PATCH: &str = "location.origin";
 
 /// 启动时一次性修补：替换默认 API 常量，并同步生成对应的 .gz（保留预压缩优势）。
-/// 结果缓存在 OnceLock 里，之后每请求只做一次查表。
-fn patched_assets() -> &'static HashMap<String, Vec<u8>> {
-    static CACHE: OnceLock<HashMap<String, Vec<u8>>> = OnceLock::new();
+/// 之后每请求只做一次 HashMap 查表 + Bytes 引用计数，不复制文件内容。
+fn patched_assets() -> &'static HashMap<String, Bytes> {
+    static CACHE: OnceLock<HashMap<String, Bytes>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let mut out = HashMap::new();
         for name in Frontend::iter() {
@@ -88,10 +97,11 @@ fn patched_assets() -> &'static HashMap<String, Vec<u8>> {
                 );
                 continue;
             }
-            let plain = text
-                .replace(DEFAULT_API_LITERAL, DEFAULT_API_PATCH)
-                .into_bytes();
-            out.insert(format!("{key}.gz"), gzip_bytes(&plain));
+            let plain = Bytes::from(
+                text.replace(DEFAULT_API_LITERAL, DEFAULT_API_PATCH)
+                    .into_bytes(),
+            );
+            out.insert(format!("{key}.gz"), Bytes::from(gzip_bytes(&plain)));
             out.insert(key.to_string(), plain);
             tracing::info!("[frontend] 已把 {key} 的默认后端地址改为同源");
         }
@@ -102,18 +112,22 @@ fn patched_assets() -> &'static HashMap<String, Vec<u8>> {
 fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     use flate2::{write::GzEncoder, Compression};
     use std::io::Write;
-    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    let mut enc = GzEncoder::new(Vec::with_capacity(data.len() / 4), Compression::default());
     if enc.write_all(data).is_err() {
         return Vec::new();
     }
     enc.finish().unwrap_or_default()
 }
 
-fn asset_bytes(key: &str) -> Option<Vec<u8>> {
+/// 零拷贝取资源：内嵌文件指向 .rodata，修补过的文件是缓存里的 Bytes 引用。
+fn asset_bytes(key: &str) -> Option<Bytes> {
     if let Some(v) = patched_assets().get(key) {
         return Some(v.clone());
     }
-    Frontend::get(key).map(|f| f.data.to_vec())
+    Frontend::get(key).map(|f| match f.data {
+        Cow::Borrowed(b) => Bytes::from_static(b),
+        Cow::Owned(v) => Bytes::from(v),
+    })
 }
 
 fn mime_of(key: &str) -> &'static str {
@@ -135,7 +149,7 @@ fn mime_of(key: &str) -> &'static str {
     }
 }
 
-fn build(status: StatusCode, mime: &str, data: Vec<u8>, gzipped: bool, cacheable: bool) -> Response {
+fn build(status: StatusCode, mime: &'static str, data: Bytes, gzipped: bool, cacheable: bool) -> Response {
     let mut b = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, mime);
@@ -162,34 +176,41 @@ fn status_only(status: StatusCode) -> Response {
         .unwrap()
 }
 
-/// 返回带引导脚本的 SPA 入口页。index.html 不缓存，保证升级后立即生效。
+/// 带引导脚本的 SPA 入口页，只在首次请求时构造一次。
 fn index_page() -> Response {
-    let Some(raw) = asset_bytes("index.html") else {
+    static PAGE: OnceLock<Bytes> = OnceLock::new();
+    let page = PAGE.get_or_init(|| {
+        let Some(raw) = asset_bytes("index.html") else {
+            return Bytes::new();
+        };
+        let html = String::from_utf8_lossy(&raw);
+        let out = if html.contains("<head>") {
+            html.replacen("<head>", &format!("<head>\n{}", bootstrap_js()), 1)
+        } else {
+            tracing::warn!("[frontend] index.html 缺少 <head>，引导脚本未注入");
+            html.to_string()
+        };
+        Bytes::from(out.into_bytes())
+    });
+    if page.is_empty() {
         return status_only(StatusCode::INTERNAL_SERVER_ERROR);
-    };
-    let html = String::from_utf8_lossy(&raw);
-    let out = if html.contains("<head>") {
-        html.replacen("<head>", &format!("<head>\n{}", bootstrap_js()), 1)
-    } else {
-        tracing::warn!("[frontend] index.html 缺少 <head>，引导脚本未注入");
-        html.to_string()
-    };
+    }
     build(
         StatusCode::OK,
         "text/html; charset=utf-8",
-        out.into_bytes(),
+        page.clone(),
         false,
         false,
     )
 }
 
 fn try_file(key: &str, accept_gzip: bool) -> Option<Response> {
-    let mime = mime_of(key).to_string();
+    let mime = mime_of(key);
 
     // 直接请求 .gz 文件时按 gzip 内容返回（mime 按去掉 .gz 后的扩展名推断）。
     if key.ends_with(".gz") {
         let data = asset_bytes(key)?;
-        return Some(build(StatusCode::OK, &mime, data, true, true));
+        return Some(build(StatusCode::OK, mime, data, true, true));
     }
 
     // 优先命中预压缩产物；修补过的 JS 也已生成对应的 .gz。
@@ -197,13 +218,13 @@ fn try_file(key: &str, accept_gzip: bool) -> Option<Response> {
         let gz_key = format!("{key}.gz");
         if let Some(data) = asset_bytes(&gz_key) {
             if !data.is_empty() {
-                return Some(build(StatusCode::OK, &mime, data, true, true));
+                return Some(build(StatusCode::OK, mime, data, true, true));
             }
         }
     }
 
     let data = asset_bytes(key)?;
-    Some(build(StatusCode::OK, &mime, data, false, true))
+    Some(build(StatusCode::OK, mime, data, false, true))
 }
 
 /// 静态资源 / SPA 入口。非 GET/HEAD 一律 405。
@@ -248,16 +269,19 @@ pub fn self_check() -> anyhow::Result<()> {
         asset_bytes("index.js").is_some(),
         "内嵌前端缺少 index.js"
     );
-    anyhow::ensure!(!BUNDLE_JS.is_empty(), "内嵌后端 bundle 为空");
+    anyhow::ensure!(
+        BUNDLE_BYTECODE.len() > 1024,
+        "内嵌后端字节码为空，请先运行 cargo run --bin gen_bytecode"
+    );
     let patched = patched_assets();
     anyhow::ensure!(
         patched.keys().any(|k| k.ends_with(".js")),
         "未能定位前端默认 API 常量，前端可能仍会连到公网 https://sub.store"
     );
     tracing::info!(
-        "[assets] 内嵌资源就绪：前端 {} 个文件，后端 bundle {} 字节",
+        "[assets] 内嵌资源就绪：前端 {} 个文件，后端字节码 {} 字节",
         Frontend::iter().count(),
-        BUNDLE_JS.len()
+        BUNDLE_BYTECODE.len()
     );
     Ok(())
 }
@@ -270,7 +294,7 @@ mod tests {
     fn embedded_files_exist() {
         assert!(asset_bytes("index.html").is_some());
         assert!(asset_bytes("chunks/main-1712152b.js").is_some());
-        assert!(BUNDLE_JS.contains("__substore") || BUNDLE_JS.len() > 1_000_000);
+        assert!(BUNDLE_BYTECODE.len() > 1_000_000);
     }
 
     #[test]

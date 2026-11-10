@@ -21,8 +21,27 @@ use tokio::{
 };
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> Result<()> {
+// 实测 mimalloc 在本场景反而增加约 20MB 私有脏页，默认用系统分配器。
+// 需要在别的负载上对比时可 `cargo build --release --features mimalloc`。
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn main() -> Result<()> {
+    // 单用户盒子上 2 个 worker 足够；线程栈也是实打实的内存开销。
+    let workers = env::var("SUB_STORE_TOKIO_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| (1..=16).contains(n))
+        .unwrap_or(2);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -34,19 +53,30 @@ async fn main() -> Result<()> {
     );
     std::fs::create_dir_all(&data_dir)?;
 
-    // 前端与后端 JS 都编译进二进制；SUB_STORE_BUNDLE 仅用于开发时覆盖。
-    let source = match env::var("SUB_STORE_BUNDLE") {
+    // 内嵌路径直接用预编译字节码（跳过 3.3MB 源码解析，也不把源码搬进堆）；
+    // 只有开发时外部覆盖 bundle 才需要退回源码编译。
+    let source: Option<&'static str> = match env::var("SUB_STORE_BUNDLE") {
         Ok(p) => {
-            let s = tokio::fs::read_to_string(&p)
-                .await
+            let s = std::fs::read_to_string(&p)
                 .with_context(|| format!("读取外部 bundle 失败: {p}"))?;
-            tracing::info!("使用外部 bundle {p} ({} 字节)", s.len());
-            s
+            tracing::info!("使用外部 bundle {p} ({} 字节)，走源码编译路径", s.len());
+            Some(Box::leak(s.into_boxed_str()))
+        }
+        Err(_) if env::var_os("SUB_STORE_FORCE_SOURCE").is_some() => {
+            // 换 CPU 架构或升级 rquickjs 后字节码可能不兼容，用这个开关临时降级。
+            // 重新生成：cargo run --bin gen_bytecode
+            tracing::warn!(
+                "强制源码编译路径（{} 字节），冷启动会变慢",
+                assets::BUNDLE_JS.len()
+            );
+            Some(assets::BUNDLE_JS)
         }
         Err(_) => {
-            let s = assets::BUNDLE_JS.to_string();
-            tracing::info!("使用内嵌 bundle ({} 字节)", s.len());
-            s
+            tracing::info!(
+                "使用内嵌预编译字节码 ({} 字节)",
+                assets::BUNDLE_BYTECODE.len()
+            );
+            None
         }
     };
     assets::self_check()?;
@@ -64,7 +94,7 @@ async fn main() -> Result<()> {
     // axum / 定时任务只持有 mpsc 发送端，请求通过 Job 投递过去，天然串行。
     let (tx, rx) = mpsc::channel::<Job>(64);
     let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
-    let thread_source = source.clone();
+    let thread_source = source;
     let thread_data_dir = data_dir.clone();
     let thread_dns = dns.clone();
     let thread_geoip = geoip.clone();
@@ -79,7 +109,7 @@ async fn main() -> Result<()> {
                 .expect("创建 QuickJS 线程 runtime 失败");
             rt.block_on(async move {
                 match host::JsHost::new(
-                    &thread_source,
+                    thread_source,
                     &thread_data_dir,
                     thread_dns,
                     thread_geoip,
@@ -167,10 +197,8 @@ async fn dispatch(State(tx): State<JobTx>, mut req: Request) -> Response {
         }
         return proxy(State(tx), req).await;
     }
-    let path = req.uri().path().to_string();
-    let method = req.method().as_str().to_string();
-    let headers = req.headers().clone();
-    assets::serve(&path, &headers, &method)
+    // 静态分支不消费 req，直接借用即可，避免整份 HeaderMap 的克隆。
+    assets::serve(req.uri().path(), req.headers(), req.method().as_str())
 }
 
 async fn proxy(State(tx): State<JobTx>, req: Request) -> Response {
@@ -180,7 +208,7 @@ async fn proxy(State(tx): State<JobTx>, req: Request) -> Response {
         Err(e) => return text(StatusCode::BAD_REQUEST, format!("读取请求体失败: {e}")),
     };
 
-    let mut headers = HashMap::new();
+    let mut headers = HashMap::with_capacity(parts.headers.len());
     for (k, v) in parts.headers.iter() {
         headers.insert(k.to_string(), v.to_str().unwrap_or("").to_string());
     }
