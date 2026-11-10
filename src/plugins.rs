@@ -45,22 +45,29 @@ impl Cache {
     }
 
     pub fn set(&self, key: &str, value: &str) {
-        self.inner
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), value.to_string());
-        self.flush();
+        let mut map = self.inner.lock().unwrap();
+        // 值没变就不落盘：Sub-Store 会频繁回写同样的内容。
+        if map.get(key).map(String::as_str) == Some(value) {
+            return;
+        }
+        map.insert(key.to_string(), value.to_string());
+        self.flush(&map);
     }
 
     pub fn remove(&self, key: &str) {
-        self.inner.lock().unwrap().remove(key);
-        self.flush();
+        let mut map = self.inner.lock().unwrap();
+        if map.remove(key).is_some() {
+            self.flush(&map);
+        }
     }
 
-    fn flush(&self) {
-        let snapshot: HashMap<String, String> = self.inner.lock().unwrap().clone();
-        if let Ok(raw) = serde_json::to_string_pretty(&snapshot) {
-            let _ = std::fs::write(&self.path, raw);
+    /// 持锁直接序列化（不再克隆整个 map、不再 pretty 输出），
+    /// 先写临时文件再 rename，既省内存/IO，也避免进程被杀时留下半截 cache.json。
+    fn flush(&self, map: &HashMap<String, String>) {
+        let Ok(raw) = serde_json::to_vec(map) else { return };
+        let tmp = self.path.with_extension("json.tmp");
+        if std::fs::write(&tmp, &raw).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.path);
         }
     }
 }
@@ -109,6 +116,9 @@ impl Http {
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(15))
+            // 单用户场景不需要长期保活一堆空闲连接（每条 TLS 连接都占缓冲区）。
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::limited(3))
             .build()
             .context("构造直连 HTTP 客户端失败")?;

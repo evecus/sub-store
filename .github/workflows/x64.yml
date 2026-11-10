@@ -2,7 +2,8 @@ name: build linux x64
 
 on:
   workflow_dispatch:
-
+  push:
+    branches: [main, master]
 jobs:
   build-x64-musl:
     runs-on: ubuntu-latest

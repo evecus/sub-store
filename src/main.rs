@@ -28,12 +28,13 @@ use tracing_subscriber::EnvFilter;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> Result<()> {
-    // 单用户盒子上 2 个 worker 足够；线程栈也是实打实的内存开销。
+    // 单用户盒子上 1 个 worker 足够（JS 本来就是单线程串行，网络 I/O 都是异步的）；
+    // 线程栈与 per-thread 分配器缓存都是实打实的内存开销。需要更高并发再用环境变量调大。
     let workers = env::var("SUB_STORE_TOKIO_WORKERS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| (1..=16).contains(n))
-        .unwrap_or(2);
+        .unwrap_or(1);
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(workers)
         .enable_all()

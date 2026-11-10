@@ -17,7 +17,11 @@ use axum::{
 };
 use bytes::Bytes;
 use rust_embed::RustEmbed;
-use std::{borrow::Cow, collections::HashMap, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 #[derive(RustEmbed)]
 #[folder = "assets/dist/"]
@@ -74,39 +78,55 @@ fn bootstrap_js() -> &'static str {
 const DEFAULT_API_LITERAL: &str = r#""https://sub.store""#;
 const DEFAULT_API_PATCH: &str = "location.origin";
 
-/// 启动时一次性修补：替换默认 API 常量，并同步生成对应的 .gz（保留预压缩优势）。
-/// 之后每请求只做一次 HashMap 查表 + Bytes 引用计数，不复制文件内容。
-fn patched_assets() -> &'static HashMap<String, Bytes> {
-    static CACHE: OnceLock<HashMap<String, Bytes>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        let mut out = HashMap::new();
-        for name in Frontend::iter() {
-            let key = name.as_ref();
-            if !key.ends_with(".js") {
-                continue;
-            }
-            let Some(file) = Frontend::get(key) else { continue };
-            let Ok(text) = std::str::from_utf8(&file.data) else { continue };
-            let hits = text.matches(DEFAULT_API_LITERAL).count();
-            if hits == 0 {
-                continue;
-            }
-            if hits != 1 {
-                tracing::warn!(
-                    "[frontend] {key} 中默认 API 字面量出现 {hits} 次，跳过替换（前端版本可能已变）"
-                );
-                continue;
-            }
-            let plain = Bytes::from(
-                text.replace(DEFAULT_API_LITERAL, DEFAULT_API_PATCH)
-                    .into_bytes(),
-            );
-            out.insert(format!("{key}.gz"), Bytes::from(gzip_bytes(&plain)));
-            out.insert(key.to_string(), plain);
-            tracing::info!("[frontend] 已把 {key} 的默认后端地址改为同源");
-        }
-        out
-    })
+/// 按需修补：只有真正被请求的 JS 文件才会扫描/替换/压缩，结果永久缓存。
+/// 之前启动时会把全部 JS chunk（约 3MB）读一遍并对命中的文件做 gzip，
+/// 既拉高启动期 RSS（文件页被触碰），也让不会被访问的文件白占内存。
+/// 值为 None 表示该文件无需修补（直接用内嵌原文件）。
+type PatchEntry = Option<(Bytes, Bytes)>; // (plain, gz)
+
+fn patch_cache() -> &'static Mutex<HashMap<String, PatchEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, PatchEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_patch(key: &str) -> PatchEntry {
+    let file = Frontend::get(key)?;
+    let text = std::str::from_utf8(&file.data).ok()?;
+    let hits = text.matches(DEFAULT_API_LITERAL).count();
+    if hits == 0 {
+        return None;
+    }
+    if hits != 1 {
+        tracing::warn!(
+            "[frontend] {key} 中默认 API 字面量出现 {hits} 次，跳过替换（前端版本可能已变）"
+        );
+        return None;
+    }
+    let plain = Bytes::from(
+        text.replace(DEFAULT_API_LITERAL, DEFAULT_API_PATCH)
+            .into_bytes(),
+    );
+    let gz = Bytes::from(gzip_bytes(&plain));
+    tracing::info!("[frontend] 已把 {key} 的默认后端地址改为同源");
+    Some((plain, gz))
+}
+
+/// 取（必要时构造）修补后的资源。`key` 可带 .gz 后缀。
+fn patched_asset(key: &str) -> Option<Bytes> {
+    let (base, want_gz) = match key.strip_suffix(".gz") {
+        Some(b) => (b, true),
+        None => (key, false),
+    };
+    if !base.ends_with(".js") {
+        return None;
+    }
+    let mut cache = patch_cache().lock().unwrap();
+    let entry = cache
+        .entry(base.to_string())
+        .or_insert_with(|| build_patch(base));
+    entry
+        .as_ref()
+        .map(|(plain, gz)| if want_gz { gz.clone() } else { plain.clone() })
 }
 
 fn gzip_bytes(data: &[u8]) -> Vec<u8> {
@@ -121,8 +141,8 @@ fn gzip_bytes(data: &[u8]) -> Vec<u8> {
 
 /// 零拷贝取资源：内嵌文件指向 .rodata，修补过的文件是缓存里的 Bytes 引用。
 fn asset_bytes(key: &str) -> Option<Bytes> {
-    if let Some(v) = patched_assets().get(key) {
-        return Some(v.clone());
+    if let Some(v) = patched_asset(key) {
+        return Some(v);
     }
     Frontend::get(key).map(|f| match f.data {
         Cow::Borrowed(b) => Bytes::from_static(b),
@@ -273,11 +293,6 @@ pub fn self_check() -> anyhow::Result<()> {
         BUNDLE_BYTECODE.len() > 1024,
         "内嵌后端字节码为空，请先运行 cargo run --bin gen_bytecode"
     );
-    let patched = patched_assets();
-    anyhow::ensure!(
-        patched.keys().any(|k| k.ends_with(".js")),
-        "未能定位前端默认 API 常量，前端可能仍会连到公网 https://sub.store"
-    );
     tracing::info!(
         "[assets] 内嵌资源就绪：前端 {} 个文件，后端字节码 {} 字节",
         Frontend::iter().count(),
@@ -299,10 +314,9 @@ mod tests {
 
     #[test]
     fn default_api_is_patched() {
-        let patched = patched_assets();
         let key = "chunks/main-1712152b.js";
-        let data = patched.get(key).expect("应已修补 main chunk");
-        let text = std::str::from_utf8(data).unwrap();
+        let data = patched_asset(key).expect("应已修补 main chunk");
+        let text = std::str::from_utf8(&data).unwrap();
         assert!(text.contains(DEFAULT_API_PATCH));
         assert!(!text.contains(DEFAULT_API_LITERAL));
     }

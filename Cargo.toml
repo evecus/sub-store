@@ -6,7 +6,7 @@ description = "Run Sub-Store backend JS in QuickJS with a Rust host, no Node.js 
 
 [dependencies]
 rquickjs = { version = "0.14", features = ["futures", "macro"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
