@@ -164,6 +164,18 @@ async fn run() -> Result<()> {
         .fallback(dispatch)
         .with_state(tx);
 
+    match backend_prefix() {
+        Some(p) => {
+            tracing::info!("[auth] 后端仅在密钥路径 {p} 下可达（/api、/download、/share 均需带此前缀）");
+            if p.len() < 12 {
+                tracing::warn!("[auth] 密钥路径只有 {} 个字符，容易被猜到；建议 16 位以上随机串", p.len() - 1);
+            }
+        }
+        None => tracing::warn!(
+            "[auth] 未设置 SUB_STORE_FRONTEND_BACKEND_PATH：后端挂在根路径，任何能访问该端口的人都能读写订阅"
+        ),
+    }
+
     let addr = env::var("SUB_STORE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".into());
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("单端口就绪：网页与 API 共用 http://{addr}");
@@ -181,6 +193,38 @@ fn is_backend_path(p: &str) -> bool {
         || matches!(p, "/api" | "/download" | "/share")
 }
 
+/// 后端路径前缀（上游同名环境变量 SUB_STORE_FRONTEND_BACKEND_PATH）。
+///
+/// 设置为 `/你的密钥路径` 后，/api、/download、/share 只在该前缀下可达
+/// （如 `/你的密钥路径/api/subs`），根路径下的后端接口一律 404；前端静态页仍在 `/`。
+/// 这个路径就是访问密码：首次打开前端会弹出“后端连接配置”，填入该路径即可，
+/// 订阅链接也是 `https://host/你的密钥路径/download/名称`。
+/// 未设置或设为 `/` 时保持旧行为（后端挂在根路径，无任何保护）。
+pub fn backend_prefix() -> Option<&'static str> {
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            let raw = env::var("SUB_STORE_FRONTEND_BACKEND_PATH").ok()?;
+            let p = raw.trim().trim_end_matches('/');
+            if p.is_empty() {
+                return None; // "" 或 "/"
+            }
+            if !p.starts_with('/') {
+                // 与上游一致：必须以 / 开头。这里直接退出，避免静默失去保护。
+                eprintln!("SUB_STORE_FRONTEND_BACKEND_PATH 必须以 \"/\" 开头，当前: {raw:?}");
+                std::process::exit(2);
+            }
+            Some(p.to_string())
+        })
+        .as_deref()
+}
+
+/// `path` 以 `prefix` 作为完整路径段开头时，返回去掉前缀后的剩余部分（以 / 开头）。
+fn strip_prefix_segment<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?;
+    (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+}
+
 /// 可选跨域白名单（上游 utils/cors.js 的 `cors=` 参数）。
 /// 未设置时走内嵌同源模式：前端与 API 同端口，浏览器不做 CORS 校验，
 /// Rust 边界直接剥离 Origin，避免上游默认白名单误伤同源的 PATCH/POST。
@@ -192,7 +236,32 @@ fn cors_config() -> Option<&'static str> {
 
 /// 单端口统一入口：API → QuickJS；其它 → 内嵌静态前端（含 SPA fallback）。
 async fn dispatch(State(tx): State<JobTx>, mut req: Request) -> Response {
-    if is_backend_path(req.uri().path()) {
+    let backend = match backend_prefix() {
+        // 密钥路径模式：只有带前缀的后端请求才会进 JS，JS 看到的是去掉前缀后的路径。
+        Some(prefix) => {
+            if let Some(rest) = strip_prefix_segment(req.uri().path(), prefix) {
+                if !is_backend_path(rest) {
+                    return text(StatusCode::NOT_FOUND, "not found".into());
+                }
+                let new_uri = match req.uri().query() {
+                    Some(q) => format!("{rest}?{q}"),
+                    None => rest.to_string(),
+                };
+                match new_uri.parse() {
+                    Ok(u) => *req.uri_mut() = u,
+                    Err(_) => return text(StatusCode::BAD_REQUEST, "bad uri".into()),
+                }
+                true
+            } else if is_backend_path(req.uri().path()) {
+                // 不带前缀直接访问 /api 等：和不存在一样，不泄露任何信息。
+                return text(StatusCode::NOT_FOUND, "not found".into());
+            } else {
+                false
+            }
+        }
+        None => is_backend_path(req.uri().path()),
+    };
+    if backend {
         if cors_config().is_none() {
             req.headers_mut().remove(header::ORIGIN);
         }
@@ -278,4 +347,25 @@ fn text(status: StatusCode, body: String) -> Response {
         .header("content-type", "text/plain; charset=utf-8")
         .body(Body::from(body))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefix_must_match_whole_segment() {
+        assert_eq!(strip_prefix_segment("/sec/api/subs", "/sec"), Some("/api/subs"));
+        assert_eq!(strip_prefix_segment("/sec", "/sec"), Some(""));
+        assert_eq!(strip_prefix_segment("/secret/api/subs", "/sec"), None);
+        assert_eq!(strip_prefix_segment("/api/subs", "/sec"), None);
+    }
+
+    #[test]
+    fn backend_paths() {
+        assert!(is_backend_path("/api/subs"));
+        assert!(is_backend_path("/download/x"));
+        assert!(!is_backend_path("/index.js"));
+        assert!(!is_backend_path(""));
+    }
 }

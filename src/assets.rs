@@ -62,12 +62,33 @@ const BOOTSTRAP_TEMPLATE: &str = r#"<script>
 </script>
 "#;
 
+/// 密钥路径模式：前端页面是公开的，绝不能把密钥路径写进 HTML。
+/// 这里只清理旧版预置的“同源后端”条目，让前端走自己的“后端连接配置”流程，
+/// 由用户在浏览器里手动输入密钥路径（保存在本机 localStorage）。
+const BOOTSTRAP_SECRET_TEMPLATE: &str = r#"<script>
+(function () {
+  try {
+    var K = '__HOST_API_KEY__', N = '__LOCAL_API_NAME__', s = JSON.parse(localStorage.getItem(K) || 'null');
+    if (s && Array.isArray(s.apis)) {
+      s.apis = s.apis.filter(function (a) { return !(a && a.name === N); });
+      if (s.current === N) s.current = '';
+      localStorage.setItem(K, JSON.stringify(s));
+    }
+  } catch (e) {}
+})();
+</script>
+"#;
+
 fn bootstrap_js() -> &'static str {
     static SCRIPT: OnceLock<String> = OnceLock::new();
     SCRIPT
         .get_or_init(|| {
-            BOOTSTRAP_TEMPLATE
-                .replace("__HOST_API_KEY__", HOST_API_KEY)
+            let tpl = if crate::backend_prefix().is_some() {
+                BOOTSTRAP_SECRET_TEMPLATE
+            } else {
+                BOOTSTRAP_TEMPLATE
+            };
+            tpl.replace("__HOST_API_KEY__", HOST_API_KEY)
                 .replace("__LOCAL_API_NAME__", LOCAL_API_NAME)
         })
         .as_str()
