@@ -22,7 +22,8 @@ use std::{
 };
 
 use crate::{
-    plugins::{Cache, Http},
+    plugins::Http,
+    store::Store,
     rust_tasks::{RustDns, RustGeoIp},
 };
 
@@ -99,7 +100,10 @@ globalThis.$Plugins = {
   SubStoreCache: {
     get:    (k)   => __rustCacheGet(k) || "{}",
     set:    (k,v) => __rustCacheSet(k, v),
-    remove: (k)   => __rustCacheRemove(k)
+    remove: (k)   => __rustCacheRemove(k),
+  // 应用状态按键持久化（订阅等数组按行 diff 写入 SQLite），避免每次整份重写
+    setKey:    (k,v) => __rustDbSetKey(k, v),
+    removeKey: (k)   => __rustDbRemoveKey(k)
   },
   Requests: async (spec) => JSON.parse(await __rustRequest(JSON.stringify(spec))),
   Notify:   (t, m) => __rustNotify(t, m)
@@ -127,7 +131,7 @@ fn q(e: rquickjs::Error) -> anyhow::Error {
 
 fn install_globals<'js>(
     ctx: &Ctx<'js>,
-    cache: Cache,
+    cache: Arc<Store>,
     http: Arc<Http>,
     dns: Arc<RustDns>,
     geoip: Arc<RustGeoIp>,
@@ -197,6 +201,24 @@ fn install_globals<'js>(
         .set(
             "__rustCacheRemove",
             Function::new(ctx.clone(), move |key: String| c.remove(&key)).map_err(q)?,
+        )
+        .map_err(q)?;
+
+    let c = cache.clone();
+    globals
+        .set(
+            "__rustDbSetKey",
+            Function::new(ctx.clone(), move |key: String, val: String| {
+                c.set_key(&key, &val)
+            })
+            .map_err(q)?,
+        )
+        .map_err(q)?;
+    let c = cache.clone();
+    globals
+        .set(
+            "__rustDbRemoveKey",
+            Function::new(ctx.clone(), move |key: String| c.remove_key(&key)).map_err(q)?,
         )
         .map_err(q)?;
 
@@ -298,7 +320,7 @@ impl JsHost {
             .map_err(q)
             .context("创建 QuickJS Context")?;
 
-        let cache = Cache::open(data_dir.join("cache.json"))?;
+        let cache = Arc::new(Store::open(&data_dir)?);
         let http = Arc::new(Http::new()?);
 
         context

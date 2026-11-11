@@ -1,76 +1,14 @@
 //! `$Plugins` 的 Rust 后端实现（GUI.for.Cores 兼容分支）。
 //!
 //! Sub-Store 在非 Node 环境下只认三个宿主能力：
-//!   - SubStoreCache.get/set/remove  → 持久化
+//!   - SubStoreCache                 → 持久化（见 store.rs）
 //!   - Requests(spec)                → 出网请求
 //!   - Notify(title, message)        → 通知
 //! 本文件把它们全部落在 Rust 侧。按需求：Requests 直连，不透传任何代理。
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
-
-// ---------------------------------------------------------------------------
-// 持久化：替代 Node 分支的 root.json + fs.writeFileSync
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct Cache {
-    inner: Arc<Mutex<HashMap<String, String>>>,
-    path: PathBuf,
-}
-
-impl Cache {
-    pub fn open(path: PathBuf) -> Result<Self> {
-        let mut map = HashMap::new();
-        if path.exists() {
-            let raw = std::fs::read_to_string(&path)
-                .with_context(|| format!("读取缓存失败: {}", path.display()))?;
-            map = serde_json::from_str(&raw).unwrap_or_default();
-        } else if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        Ok(Self {
-            inner: Arc::new(Mutex::new(map)),
-            path,
-        })
-    }
-
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.inner.lock().unwrap().get(key).cloned()
-    }
-
-    pub fn set(&self, key: &str, value: &str) {
-        let mut map = self.inner.lock().unwrap();
-        // 值没变就不落盘：Sub-Store 会频繁回写同样的内容。
-        if map.get(key).map(String::as_str) == Some(value) {
-            return;
-        }
-        map.insert(key.to_string(), value.to_string());
-        self.flush(&map);
-    }
-
-    pub fn remove(&self, key: &str) {
-        let mut map = self.inner.lock().unwrap();
-        if map.remove(key).is_some() {
-            self.flush(&map);
-        }
-    }
-
-    /// 持锁直接序列化（不再克隆整个 map、不再 pretty 输出），
-    /// 先写临时文件再 rename，既省内存/IO，也避免进程被杀时留下半截 cache.json。
-    fn flush(&self, map: &HashMap<String, String>) {
-        let Ok(raw) = serde_json::to_vec(map) else { return };
-        let tmp = self.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, &raw).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.path);
-        }
-    }
-}
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // 出网请求：替代 undici / fetch-socks / $httpClient

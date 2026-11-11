@@ -3,6 +3,7 @@ mod bundle;
 mod host;
 mod plugins;
 mod rust_tasks;
+mod store;
 
 use anyhow::{Context as _, Result};
 use axum::{

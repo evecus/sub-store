@@ -76,6 +76,73 @@ export const identityToRecipient=no, generateX25519Identity=no, generateHybridId
 export const armor={encode:no,decode:no};
 `;
 
+
+// ---------------------------------------------------------------------------
+// 持久化改造（配合 src/store.rs 的 SQLite）。对上游源码做精确字符串替换，
+// 每处都断言只命中预期次数；上游改动导致不匹配时构建直接失败，而不是静默产出坏 bundle。
+// ---------------------------------------------------------------------------
+const SOURCE_PATCHES = [
+    {
+        file: /src[\\/]vendor[\\/]open-api\.js$/,
+        edits: [
+            // persistCache：GUI.for.Cores 分支不再先把整份状态 pretty 序列化一遍，
+            // 且整体同步（仅用于 `$.cache = content` 之后）直接交给 Rust 做行级 diff。
+            [
+                "        const data = JSON.stringify(this.cache, null, 2);\n",
+                "        const data = isGUIforCores ? '' : JSON.stringify(this.cache, null, 2);\n",
+                1,
+            ],
+            [
+                "        if (isGUIforCores) $Plugins.SubStoreCache.set(this.name, data);\n",
+                "        if (isGUIforCores)\n            $Plugins.SubStoreCache.set(this.name, JSON.stringify(this.cache));\n",
+                1,
+            ],
+            // write：只把这一个键交给 Rust（数组键在 Rust 侧按行 diff，只写变化的行）
+            [
+                "        } else {\n            this.cache[key] = data;\n        }\n        this.persistCache();\n",
+                "        } else {\n            this.cache[key] = data;\n            if (isGUIforCores) {\n                return data === undefined\n                    ? $Plugins.SubStoreCache.removeKey(key)\n                    : $Plugins.SubStoreCache.setKey(key, JSON.stringify(data));\n            }\n        }\n        this.persistCache();\n",
+                1,
+            ],
+            [
+                "        } else {\n            delete this.cache[key];\n        }\n        this.persistCache();\n",
+                "        } else {\n            delete this.cache[key];\n            if (isGUIforCores) return $Plugins.SubStoreCache.removeKey(key);\n        }\n        this.persistCache();\n",
+                1,
+            ],
+        ],
+    },
+    {
+        // 还原备份：上游只在 Node 下同步内存里的 $.cache，其它环境会让内存保留旧状态，
+        // 下一次保存就把刚还原的数据覆盖掉。这里让 GUI.for.Cores 也同步。
+        file: /src[\\/]restful[\\/]miscs\.js$/,
+        edits: [
+            [
+                "if ($.env.isNode) {\n                    $.cache = content;",
+                "if ($.env.isNode || $.env.isGUIforCores) {\n                    $.cache = content;",
+                1,
+            ],
+            [
+                "if ($.env.isNode) {\n                $.cache = content;",
+                "if ($.env.isNode || $.env.isGUIforCores) {\n                $.cache = content;",
+                1,
+            ],
+        ],
+    },
+];
+
+function applySourcePatches(file, text) {
+    for (const p of SOURCE_PATCHES) {
+        if (!p.file.test(file)) continue;
+        for (const [from, to, count] of p.edits) {
+            const n = text.split(from).length - 1;
+            if (n !== count) {
+                throw new Error(`源码补丁未命中 ${path.basename(file)}（期望 ${count} 处，实际 ${n} 处）：${JSON.stringify(from.slice(0, 60))}`);
+            }
+            text = text.split(from).join(to);
+        }
+    }
+    return text;
+}
+
 build({
     entryPoints: [path.join(backend, 'src/main.js')],
     absWorkingDir: backend,
@@ -92,6 +159,11 @@ build({
                 if (a.path === 'jsrsasign') return { path: 'jsrsasign', namespace: 'slim' };
                 if (a.path === 'age-encryption' && !process.env.KEEP_AGE) return { path: 'age-encryption', namespace: 'slim' };
             });
+            b.onLoad({ filter: /src[\\/](vendor[\\/]open-api|restful[\\/]miscs)\.js$/ }, (a) => ({
+                contents: applySourcePatches(a.path, fs.readFileSync(a.path, 'utf8')),
+                loader: 'js',
+                resolveDir: path.dirname(a.path),
+            }));
             b.onLoad({ filter: /.*/, namespace: 'slim' }, (a) => ({
                 contents: a.path === 'jsrsasign' ? RS_SHIM : AGE_STUB, loader: 'js',
             }));
